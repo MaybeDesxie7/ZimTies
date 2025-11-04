@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import PrivateChatView from "./PrivateChatView";
 
@@ -14,8 +14,9 @@ interface Message {
 
 interface Profile {
   id: string;
-  full_name: string;
-  avatar_url?: string;
+  name: string;
+  profile_pic?: string | null;
+  premium?: boolean | null;
 }
 
 export default function MessagesPage() {
@@ -25,10 +26,12 @@ export default function MessagesPage() {
   const [search, setSearch] = useState("");
   const [isPaid, setIsPaid] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
+  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
 
-  // ✅ 1. Get authenticated user
+  // 1. Get authenticated user
   useEffect(() => {
     let mounted = true;
+
     const getUser = async () => {
       const { data, error } = await supabase.auth.getUser();
       if (error || !data?.user) {
@@ -55,7 +58,7 @@ export default function MessagesPage() {
     };
   }, []);
 
-  // ✅ 2. Check payment status
+  // 2. Check payment status
   useEffect(() => {
     if (!authUser?.id) {
       setIsPaid(null);
@@ -71,17 +74,14 @@ export default function MessagesPage() {
         .order("created_at", { ascending: false })
         .limit(1);
 
-      if (!error && data && data.length > 0) {
-        setIsPaid(true);
-      } else {
-        setIsPaid(false);
-      }
+      if (!error && data && data.length > 0) setIsPaid(true);
+      else setIsPaid(false);
     };
 
     checkPaid();
   }, [authUser]);
 
-  // ✅ 3. Fetch messages for the logged-in user
+  // 3. Fetch messages for current user & subscribe to realtime inserts
   useEffect(() => {
     if (!authUser?.id) return;
     let isMounted = true;
@@ -93,19 +93,20 @@ export default function MessagesPage() {
         .or(`sender_id.eq.${authUser.id},recipient_id.eq.${authUser.id}`)
         .order("created_at", { ascending: false });
 
-      if (!error && data && isMounted) setMessages(data);
+      if (!error && data && isMounted) {
+        setMessages(data);
+      }
     };
 
     fetchMessages();
 
-    // Optional: real-time listener for new messages
+    // Real-time listener for new messages
     const channel = supabase
-      .channel("messages_realtime")
+      .channel("messages_inbox")
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "messages" },
+        { event: "INSERT", schema: "public", table: "messages" },
         (payload) => {
-          if (!isMounted) return;
           const newMsg = payload.new as Message;
           if (
             newMsg.sender_id === authUser.id ||
@@ -123,34 +124,109 @@ export default function MessagesPage() {
     };
   }, [authUser]);
 
-  // ✅ 4. Derive recent unique chat partners
-  const uniqueUsers = Array.from(
-    new Map(
-      messages.map((msg) => {
-        const partnerId =
-          msg.sender_id === authUser?.id ? msg.recipient_id : msg.sender_id;
-        return [partnerId, msg];
-      })
-    ).values()
-  );
+  // 4. Derive recent unique chat partners (ordered by latest message)
+  const uniqueUsers = useMemo(() => {
+    if (!authUser) return [] as Message[];
 
-  // ✅ 5. Handle chat selection
+    const map = new Map<string, Message>();
+    for (const msg of messages) {
+      const partnerId = msg.sender_id === authUser.id ? msg.recipient_id : msg.sender_id;
+      // keep latest message (messages are ordered desc by created_at)
+      if (!map.has(partnerId)) {
+        map.set(partnerId, msg);
+      }
+    }
+    return Array.from(map.values());
+  }, [messages, authUser]);
+
+  // 5. Fetch profiles for the unique partners (Option A requirement)
+  useEffect(() => {
+    const loadProfiles = async () => {
+      const partnerIds = uniqueUsers.map((m) =>
+        m.sender_id === authUser?.id ? m.recipient_id : m.sender_id
+      );
+      // only fetch those not already present
+      const idsToFetch = partnerIds.filter((id) => !profiles[id]);
+
+      if (idsToFetch.length === 0) return;
+
+      const { data, error } = await supabase
+        .from("users")
+        .select("id, name, profile_pic, premium")
+        .in("id", idsToFetch);
+
+      if (!error && data) {
+        const nextProfiles = { ...profiles };
+        for (const p of data) {
+          nextProfiles[p.id] = {
+            id: p.id,
+            name: p.name || `User ${p.id.slice(0, 6)}`,
+            profile_pic: p.profile_pic || null,
+            premium: p.premium ?? null,
+          };
+        }
+        setProfiles(nextProfiles);
+      }
+    };
+
+    if (uniqueUsers.length > 0 && authUser) {
+      loadProfiles();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uniqueUsers, authUser]);
+
+  // 6. Handle chat selection (resolve profile from fetched profiles)
   const handleSelect = (partnerId: string) => {
     if (!authUser) return;
-    if (isPaid === false) {
-      setSelectedUser({ id: partnerId, full_name: `User ${partnerId.slice(0, 4)}` });
-      return;
-    }
 
-    setSelectedUser({
-      id: partnerId,
-      full_name: `User ${partnerId.slice(0, 6)}`,
-    });
+    const profile = profiles[partnerId];
+    if (profile) {
+      setSelectedUser(profile);
+    } else {
+      // fallback: set minimal profile until it loads
+      setSelectedUser({
+        id: partnerId,
+        name: `User ${partnerId.slice(0, 6)}`,
+        profile_pic: `https://ui-avatars.com/api/?name=User${partnerId.slice(0, 6)}`,
+      });
+      // trigger fetch of missing profile (best-effort)
+      (async () => {
+        const { data, error } = await supabase
+          .from("users")
+          .select("id, name, profile_pic, premium")
+          .eq("id", partnerId)
+          .limit(1)
+          .single();
+        if (!error && data) {
+          setProfiles((prev) => ({
+            ...prev,
+            [data.id]: {
+              id: data.id,
+              name: data.name || `User ${data.id.slice(0, 6)}`,
+              profile_pic: data.profile_pic || null,
+              premium: data.premium ?? null,
+            },
+          }));
+          setSelectedUser({
+            id: data.id,
+            name: data.name || `User ${data.id.slice(0, 6)}`,
+            profile_pic: data.profile_pic || null,
+            premium: data.premium ?? null,
+          });
+        }
+      })();
+    }
   };
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen bg-black text-white">
+      <div
+        className="flex items-center justify-center h-screen text-white"
+        style={{
+          // Zimbabwean gradient background when loading too
+          background: "linear-gradient(135deg,#007A3D 0%, #FCD116 35%, #CE1126 70%, #000 100%)",
+        }}
+      >
         <p>Loading messages...</p>
       </div>
     );
@@ -158,28 +234,39 @@ export default function MessagesPage() {
 
   if (!authUser) {
     return (
-      <div className="flex items-center justify-center h-screen bg-black text-white">
+      <div
+        className="flex items-center justify-center h-screen text-white"
+        style={{
+          background: "linear-gradient(135deg,#007A3D 0%, #FCD116 35%, #CE1126 70%, #000 100%)",
+        }}
+      >
         <p>Please log in to access messages.</p>
       </div>
     );
   }
 
-  // ✅ 6. UI rendering
+  // 7. Render UI
   return (
-    <div className="flex h-screen bg-gradient-to-br from-gray-900 via-gray-950 to-black text-white overflow-hidden">
+    <div
+      className="flex h-screen text-white overflow-hidden"
+      style={{
+        // big Zimbabwean gradient background for the whole page
+        background: "linear-gradient(135deg,#007A3D 0%, #FCD116 35%, #CE1126 70%, #000 100%)",
+      }}
+    >
       {/* Sidebar (chat list) */}
       <aside
         className={`${
           selectedUser ? "hidden md:flex" : "flex"
-        } w-full md:w-1/3 border-r border-gray-800 bg-black/40 backdrop-blur-md flex-col transition-all`}
+        } w-full md:w-1/3 border-r border-black/40 bg-black/10 backdrop-blur-md flex-col transition-all`}
       >
-        <div className="p-4 border-b border-gray-800">
+        <div className="p-4 border-b border-black/30">
           <input
             type="text"
             placeholder="Search chats..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full px-3 py-2 rounded-lg bg-gray-800 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-600"
+            className="w-full px-3 py-2 rounded-lg bg-black/60 text-white placeholder-gray-300 focus:outline-none focus:ring-2 focus:ring-yellow-300"
           />
         </div>
 
@@ -194,18 +281,29 @@ export default function MessagesPage() {
                   ? msg.recipient_id
                   : msg.sender_id;
 
+              const profile = profiles[partnerId];
+              const displayName =
+                profile?.name || `User ${partnerId.slice(0, 6)}`;
+              const avatar =
+                profile?.profile_pic ||
+                `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}`;
+
               return (
                 <li
                   key={msg.id}
                   onClick={() => handleSelect(partnerId)}
-                  className="cursor-pointer p-4 border-b border-gray-800 hover:bg-gray-800/40 transition flex items-center space-x-3"
+                  className="cursor-pointer p-4 border-b border-black/20 hover:bg-black/20 transition flex items-center space-x-3"
                 >
-                  <div className="w-10 h-10 rounded-full bg-gradient-to-br from-pink-500 to-red-500 flex-shrink-0" />
+                  <img
+                    src={avatar}
+                    className="w-10 h-10 rounded-full object-cover border border-black/30"
+                    alt={displayName}
+                  />
                   <div className="flex-1 min-w-0">
-                    <h4 className="font-semibold text-pink-400 truncate">
-                      {partnerId.slice(0, 10)}...
+                    <h4 className="font-semibold text-black/90 truncate">
+                      {displayName}
                     </h4>
-                    <p className="text-sm text-gray-400 truncate">
+                    <p className="text-sm text-black/60 truncate">
                       {msg.content}
                     </p>
                   </div>
@@ -219,7 +317,7 @@ export default function MessagesPage() {
       <main
         className={`${
           selectedUser ? "flex" : "hidden md:flex"
-        } flex-1 bg-black/30 backdrop-blur-md flex-col`}
+        } flex-1 bg-black/5 backdrop-blur-md flex-col`}
       >
         {selectedUser ? (
           <PrivateChatView
@@ -230,7 +328,7 @@ export default function MessagesPage() {
             isPaid={!!isPaid}
           />
         ) : (
-          <div className="flex items-center justify-center h-full text-gray-400">
+          <div className="flex items-center justify-center h-full text-black/60">
             <p>Select a chat to start messaging 💬</p>
           </div>
         )}
